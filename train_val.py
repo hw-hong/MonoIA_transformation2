@@ -51,6 +51,9 @@ def main():
     log_file = os.path.join(output_path, "train.log.%s" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     logger = create_logger(log_file)
 
+    # propagate consistency loss flag from trainer cfg to dataset cfg
+    cfg["dataset"]["use_consistency_loss"] = cfg["trainer"].get("use_consistency_loss", False)
+
     # build dataloader
     train_loader, test_loader = build_dataloader(cfg["dataset"])
 

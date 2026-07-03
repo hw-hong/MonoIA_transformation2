@@ -62,6 +62,7 @@ class KITTI_Dataset(data.Dataset):
         self.maintain_image_ratio = cfg.get("maintain_image_ratio", True)
         self.target_focal_list = cfg.get("target_focal_list", [748.8391264865, 900, 1100, 1300])
         self.test_focal = cfg.get("test_focal", 748.8391264865)
+        self.use_consistency_loss = cfg.get("use_consistency_loss", False)
 
         if self.class_merging:
             self.writelist.extend(["Van", "Truck"])
@@ -206,10 +207,211 @@ class KITTI_Dataset(data.Dataset):
     def __len__(self):
         return self.idx_list.__len__()
 
+    def _apply_focal_transform(self, img_pil, calib, objects, center, crop_scale,
+                                img_size, new_img_size, scale_ratio,
+                                random_flip_flag, random_mix_flag, random_index,
+                                object_num, target_focal, index):
+        """Applies focal-dependent affine transform to image and encodes labels."""
+        calib = copy.deepcopy(calib)
+
+        # compute affine transform for this focal
+        if self.resolution[1] / img_size[1] > self.resolution[0] / img_size[0]:
+            crop_ratio = calib.P2[0, 0] * self.resolution[0] / target_focal / img_size[0]
+        else:
+            crop_ratio = calib.P2[0, 0] * self.resolution[1] / target_focal / img_size[1]
+        new_crop_scale = crop_scale - 1 + crop_ratio
+        trans, trans_inv = get_affine_transform(center, new_crop_scale * img_size, 0, new_img_size, inv=1)
+
+        # transform image
+        img = img_pil.transform(
+            tuple(new_img_size.tolist()),
+            method=Image.AFFINE,
+            data=tuple(trans_inv.reshape(-1).tolist()),
+            resample=Image.BILINEAR,
+        )
+        img = self.get_image_with_padding(img, self.resolution)
+        img = np.array(img).astype(np.float32) / 255.0
+        img = (img - self.mean) / self.std
+        img = img.transpose(2, 0, 1)  # C * H * W
+
+        # label encoding arrays
+        calibs_arr = np.zeros((self.max_objs, 3, 4), dtype=np.float32)
+        indices = np.zeros((self.max_objs), dtype=np.int64)
+        mask_2d = np.zeros((self.max_objs), dtype=bool)
+        labels = np.zeros((self.max_objs), dtype=np.int8)
+        depth = np.zeros((self.max_objs, 1), dtype=np.float32)
+        heading_bin = np.zeros((self.max_objs, 1), dtype=np.int64)
+        heading_res = np.zeros((self.max_objs, 1), dtype=np.float32)
+        size_2d = np.zeros((self.max_objs, 2), dtype=np.float32)
+        size_3d = np.zeros((self.max_objs, 3), dtype=np.float32)
+        src_size_3d = np.zeros((self.max_objs, 3), dtype=np.float32)
+        boxes = np.zeros((self.max_objs, 4), dtype=np.float32)
+        boxes_3d = np.zeros((self.max_objs, 6), dtype=np.float32)
+        obj_region = np.zeros((img.shape[1], img.shape[2]), dtype=bool)
+
+        def _encode_object(obj, slot_idx):
+            """Encodes a single object into label arrays at slot_idx. Returns False if skipped."""
+            bbox_2d = obj.box2d.copy()
+            bbox_2d[:2] = affine_transform(bbox_2d[:2], trans)
+            bbox_2d[2:] = affine_transform(bbox_2d[2:], trans)
+
+            center_2d = np.array(
+                [(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2],
+                dtype=np.float32,
+            )
+
+            ymin = int(max(bbox_2d[1], 0))
+            ymax = int(min(bbox_2d[3], img.shape[1]))
+            xmin = int(max(bbox_2d[0], 0))
+            xmax = int(min(bbox_2d[2], img.shape[2]))
+            obj_region[ymin:ymax, xmin:xmax] = 1
+
+            corner_2d = bbox_2d.copy()
+
+            center_3d = obj.pos + [0, -obj.h / 2, 0]
+            center_3d = center_3d.reshape(-1, 3)
+            center_3d, _ = calib.rect_to_img(center_3d)
+            center_3d = center_3d[0]
+
+            if random_flip_flag and not self.aug_calib:
+                center_3d[0] = img_size[0] - center_3d[0]
+            center_3d = affine_transform(center_3d.reshape(-1), trans)
+
+            if center_3d[0] < 0 or center_3d[0] >= self.resolution[0]:
+                return False
+            if center_3d[1] < 0 or center_3d[1] >= self.resolution[1]:
+                return False
+
+            cls_id = self.cls2id[obj.cls_type]
+            labels[slot_idx] = cls_id
+
+            w, h = bbox_2d[2] - bbox_2d[0], bbox_2d[3] - bbox_2d[1]
+            size_2d[slot_idx] = 1.0 * w, 1.0 * h
+
+            center_2d_norm = center_2d / self.resolution
+            size_2d_norm = size_2d[slot_idx] / self.resolution
+
+            corner_2d_norm = corner_2d.copy()
+            corner_2d_norm[0:2] = corner_2d[0:2] / self.resolution
+            corner_2d_norm[2:4] = corner_2d[2:4] / self.resolution
+            center_3d_norm = center_3d / self.resolution
+
+            l = center_3d_norm[0] - corner_2d_norm[0]
+            r = corner_2d_norm[2] - center_3d_norm[0]
+            t = center_3d_norm[1] - corner_2d_norm[1]
+            b = corner_2d_norm[3] - center_3d_norm[1]
+
+            if l < 0 or r < 0 or t < 0 or b < 0:
+                if self.clip_2d:
+                    l = np.clip(l, 0, 1)
+                    r = np.clip(r, 0, 1)
+                    t = np.clip(t, 0, 1)
+                    b = np.clip(b, 0, 1)
+                else:
+                    return False
+
+            boxes[slot_idx] = (center_2d_norm[0], center_2d_norm[1], size_2d_norm[0], size_2d_norm[1])
+            boxes_3d[slot_idx] = center_3d_norm[0], center_3d_norm[1], l, r, t, b
+
+            if self.depth_scale == "normal":
+                depth[slot_idx] = obj.pos[-1] * crop_scale
+            elif self.depth_scale == "inverse":
+                depth[slot_idx] = obj.pos[-1] / crop_scale
+            elif self.depth_scale == "none":
+                depth[slot_idx] = obj.pos[-1]
+
+            heading_angle = calib.ry2alpha(obj.ry, (obj.box2d[0] + obj.box2d[2]) / 2)
+            if heading_angle > np.pi:
+                heading_angle -= 2 * np.pi
+            if heading_angle < -np.pi:
+                heading_angle += 2 * np.pi
+            heading_bin[slot_idx], heading_res[slot_idx] = angle2class(heading_angle)
+
+            src_size_3d[slot_idx] = np.array([obj.h, obj.w, obj.l], dtype=np.float32)
+            mean_size = self.cls_mean_size[self.cls2id[obj.cls_type]]
+            size_3d[slot_idx] = src_size_3d[slot_idx] - mean_size
+
+            if obj.trucation <= 0.5 and obj.occlusion <= 2:
+                mask_2d[slot_idx] = 1
+
+            calibs_arr[slot_idx] = calib.P2
+            return True
+
+        # encode primary objects (flip already applied to objects before calling this method)
+        for i in range(object_num):
+            if objects[i].cls_type not in self.writelist:
+                continue
+            if objects[i].level_str == "UnKnown" or objects[i].pos[-1] < 2:
+                continue
+            if objects[i].pos[-1] > 65:
+                continue
+            _encode_object(objects[i], i)
+
+        # encode mix objects
+        if random_mix_flag:
+            mix_objects = self.get_label(random_index)
+            if random_flip_flag:
+                for obj in mix_objects:
+                    [x1, _, x2, _] = obj.box2d
+                    obj.box2d[0], obj.box2d[2] = img_size[0] - x2, img_size[0] - x1
+                    obj.ry = np.pi - obj.ry
+                    obj.pos[0] *= -1
+                    if obj.ry > np.pi:
+                        obj.ry -= 2 * np.pi
+                    if obj.ry < -np.pi:
+                        obj.ry += 2 * np.pi
+
+            object_num_temp = (
+                len(mix_objects) if len(mix_objects) < (self.max_objs - object_num)
+                else (self.max_objs - object_num)
+            )
+            for i in range(object_num_temp):
+                if mix_objects[i].cls_type not in self.writelist:
+                    continue
+                if mix_objects[i].level_str == "UnKnown" or mix_objects[i].pos[-1] < 2:
+                    continue
+                _encode_object(mix_objects[i], i + object_num)
+
+        # finalize calib and img_size
+        if self.maintain_image_ratio:
+            img_size_out = self.resolution
+            calib.P2[0, 0] = calib.P2[0, 0] * scale_ratio
+            if target_focal is not None:
+                calib.P2[0, 0] = target_focal
+        else:
+            img_size_out = img_size
+
+        targets = {
+            "calibs": calibs_arr,
+            "indices": indices,
+            "img_size": img_size_out,
+            "labels": labels,
+            "boxes": boxes,
+            "boxes_3d": boxes_3d,
+            "depth": depth,
+            "size_2d": size_2d,
+            "size_3d": size_3d,
+            "src_size_3d": src_size_3d,
+            "heading_bin": heading_bin,
+            "heading_res": heading_res,
+            "mask_2d": mask_2d,
+            "obj_region": obj_region,
+            "target_focals": np.array([target_focal], dtype=np.float32),
+        }
+
+        info = {
+            "img_id": index,
+            "img_size": img_size_out,
+        }
+        if self.maintain_image_ratio:
+            info["trans_inv"] = trans_inv
+            info["img_size"] = self.resolution
+
+        return img, calib.P2, targets, info
+
     def __getitem__(self, item):
-        #  ============================   get inputs   ===========================
+        #  ============================   get inputs (focal-independent)   ===========================
         index = int(self.idx_list[item])  # index mapping, get real data id
-        # image loading
         img = self.get_image(index)
         img_size = np.array(img.size)
         features_size = self.resolution // self.downsample  # W * H
@@ -217,7 +419,6 @@ class KITTI_Dataset(data.Dataset):
         if self.split != "test":
             dst_W, dst_H = img_size
 
-        # data augmentation for image
         center = np.array(img_size) / 2
         crop_size, crop_scale = img_size, 1
         random_flip_flag, random_crop_flag = False, False
@@ -250,75 +451,63 @@ class KITTI_Dataset(data.Dataset):
                     center[0] += img_size[0] * np.clip(np.random.randn() * self.shift, -2 * self.shift, 2 * self.shift)
                     center[1] += img_size[1] * np.clip(np.random.randn() * self.shift, -2 * self.shift, 2 * self.shift)
 
+        random_index = None
         if random_mix_flag == True:
             count_num = 0
             random_mix_flag = False
             while count_num < 50:
                 count_num += 1
-                random_index = int(np.random.choice(self.idx_list))
-                calib_temp = self.get_calib(random_index)
+                candidate_index = int(np.random.choice(self.idx_list))
+                calib_temp = self.get_calib(candidate_index)
 
                 if calib_temp.cu == calib.cu and calib_temp.cv == calib.cv and calib_temp.fu == calib.fu and calib_temp.fv == calib.fv:
-                    img_temp = self.get_image(random_index)
+                    img_temp = self.get_image(candidate_index)
                     img_size_temp = np.array(img_temp.size)
                     dst_W_temp, dst_H_temp = img_size_temp
                     if dst_W_temp == dst_W and dst_H_temp == dst_H:
                         objects_1 = self.get_label(index)
-                        objects_2 = self.get_label(random_index)
+                        objects_2 = self.get_label(candidate_index)
                         if len(objects_1) + len(objects_2) < self.max_objs:
                             random_mix_flag = True
+                            random_index = candidate_index
                             if random_flip_flag == True:
                                 img_temp = img_temp.transpose(Image.FLIP_LEFT_RIGHT)
                             img_blend = Image.blend(img, img_temp, alpha=0.5)
                             img = img_blend
                             break
 
-        # add affine transformation for 2d images.
         new_img_size, scale_ratio = self.calculate_new_image_size(img_size, self.resolution)
-        if "train" in self.split:
-            random_focal = random.choice(self.target_focal_list)
-            self.target_focal = random_focal
-        else:
-            self.target_focal = self.test_focal
 
-        if self.resolution[1] / img_size[1] > self.resolution[0] / img_size[0]:
-            crop_ratio_for_target_focal = calib.P2[0, 0] * self.resolution[0] / self.target_focal / img_size[0]
-        else:
-            crop_ratio_for_target_focal = calib.P2[0, 0] * self.resolution[1] / self.target_focal / img_size[1]
-        new_crop_scale = crop_scale - 1 + crop_ratio_for_target_focal
-        trans, trans_inv = get_affine_transform(center, new_crop_scale * img_size, 0, new_img_size, inv=1)
-
-        img = img.transform(
-            tuple(new_img_size.tolist()),
-            method=Image.AFFINE,
-            data=tuple(trans_inv.reshape(-1).tolist()),
-            resample=Image.BILINEAR,
-        )
-        img = self.get_image_with_padding(img, self.resolution)
-
-        # image encoding
-        img = np.array(img).astype(np.float32) / 255.0
-        img = (img - self.mean) / self.std
-        img = img.transpose(2, 0, 1)  # C * H * W
-
-        info = {
-            "img_id": index,
-            "img_size": self.resolution,
-            "bbox_downsample_ratio": img_size / features_size,
-            "trans_inv": trans_inv,
-        }
-
+        # test split: single focal, no label encoding
         if self.split == "test":
-            calib = self.get_calib(index)
-            targets = {"target_focals": np.array([self.target_focal], dtype=np.float32)}
-            calib.P2[0, 0] = self.target_focal
-            return img, calib.P2, targets, info
+            self.target_focal = self.test_focal
+            if self.resolution[1] / img_size[1] > self.resolution[0] / img_size[0]:
+                crop_ratio = calib.P2[0, 0] * self.resolution[0] / self.test_focal / img_size[0]
+            else:
+                crop_ratio = calib.P2[0, 0] * self.resolution[1] / self.test_focal / img_size[1]
+            new_crop_scale = crop_scale - 1 + crop_ratio
+            trans, trans_inv = get_affine_transform(center, new_crop_scale * img_size, 0, new_img_size, inv=1)
+            img = img.transform(
+                tuple(new_img_size.tolist()),
+                method=Image.AFFINE,
+                data=tuple(trans_inv.reshape(-1).tolist()),
+                resample=Image.BILINEAR,
+            )
+            img = self.get_image_with_padding(img, self.resolution)
+            img = np.array(img).astype(np.float32) / 255.0
+            img = (img - self.mean) / self.std
+            img = img.transpose(2, 0, 1)
+            calib_test = self.get_calib(index)
+            calib_test.P2[0, 0] = self.test_focal
+            targets = {"target_focals": np.array([self.test_focal], dtype=np.float32)}
+            info = {"img_id": index, "img_size": self.resolution, "trans_inv": trans_inv}
+            return img, calib_test.P2, targets, info
 
-        #  ============================   get labels   ==============================
+        #  ============================   get labels (focal-independent)   ==============================
         objects = self.get_label(index)
         calib = self.get_calib(index)
+        object_num = len(objects) if len(objects) < self.max_objs else self.max_objs
 
-        # data augmentation for labels
         if random_flip_flag:
             if self.aug_calib:
                 calib.flip(img_size)
@@ -330,7 +519,7 @@ class KITTI_Dataset(data.Dataset):
                 if self.aug_calib:
                     object.pos[0] *= -1
                 if object.alpha > np.pi:
-                    object.alpha -= 2 * np.pi  # check range
+                    object.alpha -= 2 * np.pi
                 if object.alpha < -np.pi:
                     object.alpha += 2 * np.pi
                 if object.ry > np.pi:
@@ -338,330 +527,32 @@ class KITTI_Dataset(data.Dataset):
                 if object.ry < -np.pi:
                     object.ry += 2 * np.pi
 
-        # labels encoding
-        calibs = np.zeros((self.max_objs, 3, 4), dtype=np.float32)
-        indices = np.zeros((self.max_objs), dtype=np.int64)
-        mask_2d = np.zeros((self.max_objs), dtype=bool)
-        labels = np.zeros((self.max_objs), dtype=np.int8)
-        depth = np.zeros((self.max_objs, 1), dtype=np.float32)
-        heading_bin = np.zeros((self.max_objs, 1), dtype=np.int64)
-        heading_res = np.zeros((self.max_objs, 1), dtype=np.float32)
-        size_2d = np.zeros((self.max_objs, 2), dtype=np.float32)
-        size_3d = np.zeros((self.max_objs, 3), dtype=np.float32)
-        src_size_3d = np.zeros((self.max_objs, 3), dtype=np.float32)
-        boxes = np.zeros((self.max_objs, 4), dtype=np.float32)
-        boxes_3d = np.zeros((self.max_objs, 6), dtype=np.float32)
-
-        obj_region = np.zeros((img.shape[1], img.shape[2]), dtype=bool)  # (H, W)
-
-        object_num = len(objects) if len(objects) < self.max_objs else self.max_objs
-
-        for i in range(object_num):
-            # filter objects by writelist
-            if objects[i].cls_type not in self.writelist:
-                continue
-
-            # filter inappropriate samples
-            if objects[i].level_str == "UnKnown" or objects[i].pos[-1] < 2:
-                continue
-
-            # ignore the samples beyond the threshold [hard encoding]
-            threshold = 65
-            if objects[i].pos[-1] > threshold:
-                continue
-
-            # process 2d bbox & get 2d center
-            bbox_2d = objects[i].box2d.copy()
-
-            # add affine transformation for 2d boxes.
-            bbox_2d[:2] = affine_transform(bbox_2d[:2], trans)
-            bbox_2d[2:] = affine_transform(bbox_2d[2:], trans)
-
-            # process 3d center
-            center_2d = np.array(
-                [(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2],
-                dtype=np.float32,
-            )  # W * H
-
-            # create object region
-            ymin, ymax = int(max(bbox_2d[1], 0)), int(min(bbox_2d[3], img.shape[1]))
-            xmin, xmax = int(max(bbox_2d[0], 0)), int(min(bbox_2d[2], img.shape[2]))
-            obj_region[ymin:ymax, xmin:xmax] = 1
-
-            corner_2d = bbox_2d.copy()
-
-            center_3d = objects[i].pos + [
-                0,
-                -objects[i].h / 2,
-                0,
-            ]  # real 3D center in 3D space
-            center_3d = center_3d.reshape(-1, 3)  # shape adjustment (N, 3)
-
-            center_3d, rect_depth = calib.rect_to_img(center_3d)  # project 3D center to image plane
-            center_3d = center_3d[0]  # shape adjustment
-
-            if random_flip_flag and not self.aug_calib:  # random flip for center3d
-                center_3d[0] = img_size[0] - center_3d[0]
-            center_3d = affine_transform(center_3d.reshape(-1), trans)
-
-            # filter 3d center out of img
-            proj_inside_img = True
-
-            if center_3d[0] < 0 or center_3d[0] >= self.resolution[0]:
-                proj_inside_img = False
-            if center_3d[1] < 0 or center_3d[1] >= self.resolution[1]:
-                proj_inside_img = False
-
-            if proj_inside_img == False:
-                continue
-
-            # class
-            cls_id = self.cls2id[objects[i].cls_type]
-            labels[i] = cls_id
-
-            # encoding 2d/3d boxes
-            w, h = bbox_2d[2] - bbox_2d[0], bbox_2d[3] - bbox_2d[1]
-            size_2d[i] = 1.0 * w, 1.0 * h
-
-            center_2d_norm = center_2d / self.resolution
-            size_2d_norm = size_2d[i] / self.resolution
-
-            corner_2d_norm = corner_2d
-            corner_2d_norm[0:2] = corner_2d[0:2] / self.resolution
-            corner_2d_norm[2:4] = corner_2d[2:4] / self.resolution
-            center_3d_norm = center_3d / self.resolution
-
-            l, r = (
-                center_3d_norm[0] - corner_2d_norm[0],
-                corner_2d_norm[2] - center_3d_norm[0],
+        #  ============================   focal-dependent transform   ==============================
+        if self.use_consistency_loss and "train" in self.split:
+            # consistency training: two different focal versions of the same image
+            focal_A = random.choice(self.target_focal_list)
+            remaining = [f for f in self.target_focal_list if f != focal_A]
+            focal_B = random.choice(remaining)
+            sample_A = self._apply_focal_transform(
+                img, calib, objects, center, crop_scale, img_size,
+                new_img_size, scale_ratio, random_flip_flag,
+                random_mix_flag, random_index, object_num, focal_A, index,
             )
-            t, b = (
-                center_3d_norm[1] - corner_2d_norm[1],
-                corner_2d_norm[3] - center_3d_norm[1],
+            sample_B = self._apply_focal_transform(
+                img, calib, objects, center, crop_scale, img_size,
+                new_img_size, scale_ratio, random_flip_flag,
+                random_mix_flag, random_index, object_num, focal_B, index,
             )
-
-            if l < 0 or r < 0 or t < 0 or b < 0:
-                if self.clip_2d:
-                    l = np.clip(l, 0, 1)
-                    r = np.clip(r, 0, 1)
-                    t = np.clip(t, 0, 1)
-                    b = np.clip(b, 0, 1)
-                else:
-                    continue
-
-            boxes[i] = (
-                center_2d_norm[0],
-                center_2d_norm[1],
-                size_2d_norm[0],
-                size_2d_norm[1],
+            return sample_A, sample_B
+        else:
+            # single-focal path (val/test always, train when not use_consistency_loss)
+            if "train" in self.split:
+                target_focal = random.choice(self.target_focal_list)
+            else:
+                target_focal = self.test_focal
+            self.target_focal = target_focal
+            return self._apply_focal_transform(
+                img, calib, objects, center, crop_scale, img_size,
+                new_img_size, scale_ratio, random_flip_flag,
+                random_mix_flag, random_index, object_num, target_focal, index,
             )
-            boxes_3d[i] = center_3d_norm[0], center_3d_norm[1], l, r, t, b
-
-            # encoding depth
-            if self.depth_scale == "normal":
-                depth[i] = objects[i].pos[-1] * crop_scale
-
-            elif self.depth_scale == "inverse":
-                depth[i] = objects[i].pos[-1] / crop_scale
-
-            elif self.depth_scale == "none":
-                depth[i] = objects[i].pos[-1]
-
-            # encoding heading angle
-            heading_angle = calib.ry2alpha(objects[i].ry, (objects[i].box2d[0] + objects[i].box2d[2]) / 2)
-            if heading_angle > np.pi:
-                heading_angle -= 2 * np.pi  # check range
-            if heading_angle < -np.pi:
-                heading_angle += 2 * np.pi
-            heading_bin[i], heading_res[i] = angle2class(heading_angle)
-
-            # encoding size_3d
-            src_size_3d[i] = np.array([objects[i].h, objects[i].w, objects[i].l], dtype=np.float32)
-            mean_size = self.cls_mean_size[self.cls2id[objects[i].cls_type]]
-            size_3d[i] = src_size_3d[i] - mean_size
-
-            if objects[i].trucation <= 0.5 and objects[i].occlusion <= 2:
-                mask_2d[i] = 1
-
-            calibs[i] = calib.P2
-
-        if random_mix_flag == True:
-            # if False:
-            objects = self.get_label(random_index)
-            # data augmentation for labels
-            if random_flip_flag:
-                for object in objects:
-                    [x1, _, x2, _] = object.box2d
-                    object.box2d[0], object.box2d[2] = (
-                        img_size[0] - x2,
-                        img_size[0] - x1,
-                    )
-                    object.ry = np.pi - object.ry
-                    object.pos[0] *= -1
-                    if object.ry > np.pi:
-                        object.ry -= 2 * np.pi
-                    if object.ry < -np.pi:
-                        object.ry += 2 * np.pi
-            object_num_temp = len(objects) if len(objects) < (self.max_objs - object_num) else (self.max_objs - object_num)
-            for i in range(object_num_temp):
-                if objects[i].cls_type not in self.writelist:
-                    continue
-
-                if objects[i].level_str == "UnKnown" or objects[i].pos[-1] < 2:
-                    continue
-                # process 2d bbox & get 2d center
-                bbox_2d = objects[i].box2d.copy()
-                # add affine transformation for 2d boxes.
-                bbox_2d[:2] = affine_transform(bbox_2d[:2], trans)
-                bbox_2d[2:] = affine_transform(bbox_2d[2:], trans)
-
-                # process 3d center
-                center_2d = np.array(
-                    [(bbox_2d[0] + bbox_2d[2]) / 2, (bbox_2d[1] + bbox_2d[3]) / 2],
-                    dtype=np.float32,
-                )  # W * H
-
-                # create object region
-                ymin, ymax = int(max(bbox_2d[1], 0)), int(min(bbox_2d[3], img.shape[1]))
-                xmin, xmax = int(max(bbox_2d[0], 0)), int(min(bbox_2d[2], img.shape[2]))
-                obj_region[ymin:ymax, xmin:xmax] = 1
-
-                corner_2d = bbox_2d.copy()
-
-                center_3d = objects[i].pos + [
-                    0,
-                    -objects[i].h / 2,
-                    0,
-                ]  # real 3D center in 3D space
-                center_3d = center_3d.reshape(-1, 3)  # shape adjustment (N, 3)
-                center_3d, _ = calib.rect_to_img(center_3d)  # project 3D center to image plane
-                center_3d = center_3d[0]  # shape adjustment
-                if random_flip_flag and not self.aug_calib:  # random flip for center3d
-                    center_3d[0] = img_size[0] - center_3d[0]
-                center_3d = affine_transform(center_3d.reshape(-1), trans)
-
-                # filter 3d center out of img
-                proj_inside_img = True
-
-                if center_3d[0] < 0 or center_3d[0] >= self.resolution[0]:
-                    proj_inside_img = False
-                if center_3d[1] < 0 or center_3d[1] >= self.resolution[1]:
-                    proj_inside_img = False
-
-                if proj_inside_img == False:
-                    continue
-
-                # class
-                cls_id = self.cls2id[objects[i].cls_type]
-                labels[i + object_num] = cls_id
-
-                # encoding 2d/3d boxes
-                w, h = bbox_2d[2] - bbox_2d[0], bbox_2d[3] - bbox_2d[1]
-                size_2d[i + object_num] = 1.0 * w, 1.0 * h
-
-                center_2d_norm = center_2d / self.resolution
-                size_2d_norm = size_2d[i + object_num] / self.resolution
-
-                corner_2d_norm = corner_2d
-                corner_2d_norm[0:2] = corner_2d[0:2] / self.resolution
-                corner_2d_norm[2:4] = corner_2d[2:4] / self.resolution
-                center_3d_norm = center_3d / self.resolution
-
-                l, r = (
-                    center_3d_norm[0] - corner_2d_norm[0],
-                    corner_2d_norm[2] - center_3d_norm[0],
-                )
-                t, b = (
-                    center_3d_norm[1] - corner_2d_norm[1],
-                    corner_2d_norm[3] - center_3d_norm[1],
-                )
-
-                if l < 0 or r < 0 or t < 0 or b < 0:
-                    if self.clip_2d:
-                        l = np.clip(l, 0, 1)
-                        r = np.clip(r, 0, 1)
-                        t = np.clip(t, 0, 1)
-                        b = np.clip(b, 0, 1)
-                    else:
-                        continue
-
-                boxes[i + object_num] = (
-                    center_2d_norm[0],
-                    center_2d_norm[1],
-                    size_2d_norm[0],
-                    size_2d_norm[1],
-                )
-                boxes_3d[i + object_num] = (
-                    center_3d_norm[0],
-                    center_3d_norm[1],
-                    l,
-                    r,
-                    t,
-                    b,
-                )
-
-                # encoding depth
-                if self.depth_scale == "normal":
-                    depth[i + object_num] = objects[i].pos[-1] * crop_scale
-
-                elif self.depth_scale == "inverse":
-                    depth[i + object_num] = objects[i].pos[-1] / crop_scale
-
-                elif self.depth_scale == "none":
-                    depth[i + object_num] = objects[i].pos[-1]
-
-                # encoding heading angle
-                # heading_angle = objects[i].alpha
-                heading_angle = calib.ry2alpha(objects[i].ry, (objects[i].box2d[0] + objects[i].box2d[2]) / 2)
-                if heading_angle > np.pi:
-                    heading_angle -= 2 * np.pi  # check range
-                if heading_angle < -np.pi:
-                    heading_angle += 2 * np.pi
-                heading_bin[i + object_num], heading_res[i + object_num] = angle2class(heading_angle)
-
-                # offset_3d[i + object_num] = center_3d - center_heatmap
-                src_size_3d[i + object_num] = np.array([objects[i].h, objects[i].w, objects[i].l], dtype=np.float32)
-                mean_size = self.cls_mean_size[self.cls2id[objects[i].cls_type]]
-                size_3d[i + object_num] = src_size_3d[i + object_num] - mean_size
-
-                if objects[i].trucation <= 0.5 and objects[i].occlusion <= 2:
-                    mask_2d[i + object_num] = 1
-
-                calibs[i + object_num] = calib.P2
-
-        # collect return data
-        inputs = img
-        if self.maintain_image_ratio:
-            img_size = self.resolution
-            calib.P2[0, 0] = calib.P2[0, 0] * scale_ratio
-            if self.target_focal is not None:
-                calib.P2[0, 0] = self.target_focal
-
-        targets = {
-            "calibs": calibs,
-            "indices": indices,
-            "img_size": img_size,
-            "labels": labels,
-            "boxes": boxes,
-            "boxes_3d": boxes_3d,
-            "depth": depth,
-            "size_2d": size_2d,
-            "size_3d": size_3d,
-            "src_size_3d": src_size_3d,
-            "heading_bin": heading_bin,
-            "heading_res": heading_res,
-            "mask_2d": mask_2d,
-            "obj_region": obj_region,
-            "target_focals": np.array([self.target_focal], dtype=np.float32),
-        }
-
-        info = {
-            "img_id": index,
-            "img_size": img_size,
-            # "bbox_downsample_ratio": img_size / features_size,
-        }
-        if self.maintain_image_ratio:
-            info["trans_inv"] = trans_inv
-            info["img_size"] = self.resolution
-
-        return inputs, calib.P2, targets, info

@@ -26,3 +26,6 @@ outputs/
 logs/
 data/
 
+/logs
+/outputs
+*.pth
