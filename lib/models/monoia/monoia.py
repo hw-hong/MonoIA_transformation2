@@ -4,6 +4,7 @@ MonoDETR: Depth-aware Transformer for Monocular 3D Object Detection
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.ops import roi_align
 import math
 import copy
 import numpy as np
@@ -23,6 +24,7 @@ from .region_seg_head import RegionSegHead
 from .attribute_net import AttributeNet
 from .position_encoding import PositionEmbeddingSine
 from .connector import Connector
+from .focal_transform import FocalFeatureTransform
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -32,8 +34,9 @@ def _get_clones(module, N):
 
 class MonoIA(nn.Module):
     """ This is the MonoIA module that performs monocualr 3D object detection """
-    def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels, 
-                 aux_loss=True, with_box_refine=False, init_box=False, group_num=11, num_channels=[512, 1024, 2048], target_focal_list=[700], focal_embedding_path=None):
+    def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
+                 aux_loss=True, with_box_refine=False, init_box=False, group_num=11, num_channels=[512, 1024, 2048], target_focal_list=[700], focal_embedding_path=None,
+                 use_focal_transform=False, focal_transform_level=1, focal_transform_roi_size=7):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -91,7 +94,13 @@ class MonoIA(nn.Module):
             
             self.focal_embedding = nn.Embedding.from_pretrained(torch.tensor(focal_embedding, dtype=torch.float32), freeze=True)
             self.connector = Connector(focal_embedding_dim, hidden_dim, hidden_dim, 2, act="gelu")
-       
+
+        self.use_focal_transform = use_focal_transform
+        self.focal_transform_level = focal_transform_level
+        self.focal_transform_roi_size = focal_transform_roi_size
+        if use_focal_transform:
+            self.focal_transform_net = FocalFeatureTransform(hidden_dim)
+
         if init_box == True:
             nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
@@ -200,13 +209,21 @@ class MonoIA(nn.Module):
                 
                 
         
+        # raw per-level CNN features, before any focal conditioning is injected below.
+        # used by the focal-transform module, which needs the un-shifted object appearance.
+        backbone_feats = [s.clone() for s in srcs] if self.use_focal_transform else None
+
         # get focal embeddings for each image in the batch
         target_focal = targets["target_focals"].cuda()
+        if self.use_focal_transform:
+            # real, un-augmented focal of the camera that took this photo - the focal-transform
+            # module always normalizes the current (possibly augmented) view back toward this.
+            orig_focal = targets["orig_focal"].cuda()
         batch_indices = torch.tensor([self.focal2idx[round(float(val.item()), 4)] for val in target_focal]).cuda()
         batch_embeddings = self.focal_embedding(batch_indices)
-        batch_embeddings = self.connector(batch_embeddings)  
-        
-        
+        batch_embeddings = self.connector(batch_embeddings)
+
+
         # feature-level adaptation
         for i in range(len(srcs)):
                 srcs[i] += batch_embeddings[:, :, None, None]
@@ -231,6 +248,8 @@ class MonoIA(nn.Module):
         outputs_3d_dims = []
         outputs_depths = []
         outputs_angles = []
+        roi_vecs = []
+        roi_corrections = []
 
         for lvl in range(hs.shape[0]):
             if lvl == 0:
@@ -254,12 +273,37 @@ class MonoIA(nn.Module):
             # classes
             outputs_class = self.class_embed[lvl](hs[lvl])
             outputs_classes.append(outputs_class)
-            
-            
+
+            # focal-aware object-level correction: pull the raw appearance feature at this
+            # query's own predicted box and let it nudge the query's hidden state toward
+            # what it would look like at this image's own original (un-augmented) focal,
+            # before the 3D attribute heads run.
+            if self.use_focal_transform:
+                feat_level = backbone_feats[self.focal_transform_level]
+                Hf, Wf = feat_level.shape[-2:]
+                cx, cy = outputs_coord[..., 0], outputs_coord[..., 1]
+                l, r, t, b = outputs_coord[..., 2], outputs_coord[..., 3], outputs_coord[..., 4], outputs_coord[..., 5]
+                boxes = torch.stack([(cx - l) * Wf, (cy - t) * Hf, (cx + r) * Wf, (cy + b) * Hf], dim=-1)  # [B, Q, 4]
+                boxes_list = [boxes[bi] for bi in range(boxes.shape[0])]
+                roi_feat = roi_align(feat_level, boxes_list, output_size=self.focal_transform_roi_size, aligned=True)
+                roi_vec = roi_feat.mean(dim=[-1, -2]).view(boxes.shape[0], boxes.shape[1], -1)  # [B, Q, C]
+
+                delta_f = torch.log(orig_focal / target_focal).view(-1, 1, 1).expand(-1, boxes.shape[1], -1)
+                correction = self.focal_transform_net(
+                    roi_vec.reshape(-1, roi_vec.shape[-1]),
+                    delta_f.reshape(-1, 1),
+                ).view(boxes.shape[0], boxes.shape[1], -1)
+
+                roi_vecs.append(roi_vec)
+                roi_corrections.append(correction)
+                hs_lvl = hs[lvl] + correction
+            else:
+                hs_lvl = hs[lvl]
+
             # 1) 3D size
             # query-level adaptation
-            size_feat = self.sizeNet[lvl](hs[lvl] + batch_embeddings.unsqueeze(1))
-            size_feat = size_feat + hs[lvl]
+            size_feat = self.sizeNet[lvl](hs_lvl + batch_embeddings.unsqueeze(1))
+            size_feat = size_feat + hs_lvl
             size3d_chain = self.dim_embed_3d[lvl](size_feat)  # [B, Q, 3]
             outputs_3d_dims.append(size3d_chain)
 
@@ -303,6 +347,10 @@ class MonoIA(nn.Module):
         out['pred_angle'] = outputs_angle[-1]
         out['pred_depth_map_logits'] = pred_depth_map_logits
         out['pred_region_prob'] = region_probs
+
+        if self.use_focal_transform:
+            out['roi_vec'] = roi_vecs[-1]
+            out['roi_correction'] = roi_corrections[-1]
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
@@ -621,8 +669,11 @@ def build(cfg):
         init_box=cfg['init_box'],
         num_channels=cfg['num_channels'],
         target_focal_list=cfg['target_focal_list'],
-        focal_embedding_path=cfg['focal_embedding_path'])
-    
+        focal_embedding_path=cfg['focal_embedding_path'],
+        use_focal_transform=cfg.get('use_focal_transform', False),
+        focal_transform_level=cfg.get('focal_transform_level', 1),
+        focal_transform_roi_size=cfg.get('focal_transform_roi_size', 7))
+
 
     # matcher
     matcher = build_matcher(cfg)

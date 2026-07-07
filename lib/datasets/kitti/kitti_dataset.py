@@ -213,6 +213,7 @@ class KITTI_Dataset(data.Dataset):
                                 object_num, target_focal, index):
         """Applies focal-dependent affine transform to image and encodes labels."""
         calib = copy.deepcopy(calib)
+        orig_focal = float(calib.P2[0, 0])  # real camera focal, before target_focal augmentation below
 
         # compute affine transform for this focal
         if self.resolution[1] / img_size[1] > self.resolution[0] / img_size[0]:
@@ -397,6 +398,7 @@ class KITTI_Dataset(data.Dataset):
             "mask_2d": mask_2d,
             "obj_region": obj_region,
             "target_focals": np.array([target_focal], dtype=np.float32),
+            "orig_focal": np.array([orig_focal], dtype=np.float32),
         }
 
         info = {
@@ -498,8 +500,12 @@ class KITTI_Dataset(data.Dataset):
             img = (img - self.mean) / self.std
             img = img.transpose(2, 0, 1)
             calib_test = self.get_calib(index)
+            orig_focal = float(calib_test.P2[0, 0])
             calib_test.P2[0, 0] = self.test_focal
-            targets = {"target_focals": np.array([self.test_focal], dtype=np.float32)}
+            targets = {
+                "target_focals": np.array([self.test_focal], dtype=np.float32),
+                "orig_focal": np.array([orig_focal], dtype=np.float32),
+            }
             info = {"img_id": index, "img_size": self.resolution, "trans_inv": trans_inv}
             return img, calib_test.P2, targets, info
 

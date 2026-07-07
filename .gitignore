@@ -29,3 +29,5 @@ data/
 /logs
 /outputs
 *.pth
+
+.claude/settings.local.json

@@ -123,21 +123,41 @@ class Trainer(object):
 
         use_consistency = self.cfg.get('use_consistency_loss', False)
         consistency_coef = self.cfg.get('consistency_loss_coef', 0.1)
+        use_focal_transform = getattr(self.model, 'use_focal_transform', False)
+        focal_transform_coef = self.cfg.get('focal_transform_loss_coef', 0.0)
 
         # CSV logging setup (consistency mode only)
-        # csv_path = os.path.join(self.output_dir, 'consistency_log.csv')
-        csv_path = "/nas2/data/heewon.hong/MonoIA_consistency/debug/consistency_log.csv"
+        csv_path = os.path.join(self.output_dir, 'consistency_log.csv')
         csv_header = ['epoch', 'iter', 'loss_cons', 'loss_det_A', 'loss_det_B',
                       'num_pairs', 'dim_diff', 'angle_diff']
-        print(f"[CSV DEBUG] use_consistency={use_consistency}, csv_path={csv_path}")
         if use_consistency:
             os.makedirs(self.output_dir, exist_ok=True)
-            print(f"[CSV DEBUG] Creating/checking CSV file...")
             with open(csv_path, 'a', newline='') as f:
                 w = csv.writer(f)
                 if os.path.getsize(csv_path) == 0:
                     w.writerow(csv_header)
-            print(f"[CSV DEBUG] CSV ready at: {os.path.abspath(csv_path)}")
+
+        # separate CSV log for the focal-transform relationship loss (own schema,
+        # doesn't touch consistency_log.csv so existing debug/plot_consistency_logs.py keeps working)
+        ftr_csv_path = os.path.join(self.output_dir, 'focal_transform_log.csv')
+        ftr_csv_header = ['epoch', 'iter', 'loss_ftr', 'num_pairs']
+
+        # raw, per-matched-object-pair log (one row per pair, not averaged) - lets you
+        # look at the actual distribution instead of just the batch-mean loss.
+        ftr_raw_csv_path = os.path.join(self.output_dir, 'focal_transform_raw_log.csv')
+        ftr_raw_csv_header = ['epoch', 'iter', 'b', 'raw_idx', 'query_A', 'query_B',
+                              'focal_A', 'focal_B', 'delta_f', 'identity_diff', 'pair_loss',
+                              'correction_norm', 'roi_A_norm', 'roi_B_norm']
+        if use_consistency and use_focal_transform:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(ftr_csv_path, 'a', newline='') as f:
+                w = csv.writer(f)
+                if os.path.getsize(ftr_csv_path) == 0:
+                    w.writerow(ftr_csv_header)
+            with open(ftr_raw_csv_path, 'a', newline='') as f:
+                w = csv.writer(f)
+                if os.path.getsize(ftr_raw_csv_path) == 0:
+                    w.writerow(ftr_raw_csv_header)
 
         progress_bar = tqdm.tqdm(total=len(self.train_loader), leave=(self.epoch+1 == self.cfg['max_epoch']), desc='iters')
         for batch_idx, batch in enumerate(self.train_loader):
@@ -186,10 +206,22 @@ class Trainer(object):
                     mask_2d_A, mask_2d_B,
                 )
 
+                if use_focal_transform:
+                    loss_ftr, ftr_stats, ftr_raw_records = self.compute_focal_transform_loss(
+                        outputs_A, outputs_B,
+                        targets_A_list, targets_B_list,
+                        mask_2d_A, mask_2d_B,
+                        targets_A_raw, targets_B_raw,
+                    )
+                else:
+                    loss_ftr = outputs_A['pred_3d_dim'].new_zeros(1).squeeze()
+                    ftr_stats = {'num_pairs': 0}
+                    ftr_raw_records = []
+
                 weight_dict = self.detr_loss.weight_dict
                 loss_det_A = sum(losses_dict_A[k] * weight_dict[k] for k in losses_dict_A if k in weight_dict)
                 loss_det_B = sum(losses_dict_B[k] * weight_dict[k] for k in losses_dict_B if k in weight_dict)
-                total_loss = loss_det_A + loss_det_B + consistency_coef * loss_cons
+                total_loss = loss_det_A + loss_det_B + consistency_coef * loss_cons + focal_transform_coef * loss_ftr
 
                 # CSV logging every 8 iterations
                 if batch_idx % 8 == 0:
@@ -204,6 +236,23 @@ class Trainer(object):
                             round(cons_stats['dim_diff'], 6),
                             round(cons_stats['angle_diff'], 6),
                         ])
+
+                if use_focal_transform and batch_idx % 8 == 0:
+                    with open(ftr_csv_path, 'a', newline='') as f:
+                        csv.writer(f).writerow([
+                            epoch,
+                            batch_idx,
+                            round(loss_ftr.item(), 6),
+                            ftr_stats['num_pairs'],
+                        ])
+                    with open(ftr_raw_csv_path, 'a', newline='') as f:
+                        w = csv.writer(f)
+                        for rec in ftr_raw_records:
+                            w.writerow([
+                                epoch, batch_idx, rec['b'], rec['raw_idx'], rec['query_A'], rec['query_B'],
+                                rec['focal_A'], rec['focal_B'], rec['delta_f'], rec['identity_diff'],
+                                rec['pair_loss'], rec['correction_norm'], rec['roi_A_norm'], rec['roi_B_norm'],
+                            ])
 
                 # console logging
                 if batch_idx % 30 == 0:
@@ -349,6 +398,96 @@ class Trainer(object):
             'angle_diff': angle_diff_sum / num_pairs,
         }
         return total_loss / num_pairs, stats
+
+    def compute_focal_transform_loss(self, outputs_A, outputs_B, targets_A_list, targets_B_list,
+                                      mask_2d_A, mask_2d_B, targets_A_raw, targets_B_raw):
+        """
+        For each physical object seen in both focal versions, predicts the object's
+        real, observed focal-B RoI feature from its real, observed focal-A RoI feature
+        plus the actual log(focal_B/focal_A) ratio, and checks it against the true
+        focal-B feature (detached). This is what actually teaches focal_transform_net
+        the source->target relationship - the correction wired into MonoIA.forward only
+        gets an indirect signal from the detection losses (loss_dim/loss_angle/loss_depth).
+        """
+        zero = outputs_A['pred_3d_dim'].new_zeros(1).squeeze()
+        if 'roi_vec' not in outputs_A or 'roi_vec' not in outputs_B:
+            return zero, {'num_pairs': 0}, []
+
+        batch_size = mask_2d_A.shape[0]
+        indices_A = self.detr_loss.matcher(outputs_A, targets_A_list, group_num=1)
+        indices_B = self.detr_loss.matcher(outputs_B, targets_B_list, group_num=1)
+
+        focal_A = targets_A_raw['target_focals']  # [B, 1]
+        focal_B = targets_B_raw['target_focals']  # [B, 1]
+
+        total_loss = outputs_A['roi_vec'].new_zeros(1).squeeze()
+        num_pairs = 0
+        raw_records = []  # one row per matched object pair - for raw CSV logging
+
+        for b in range(batch_size):
+            raw_A = mask_2d_A[b].nonzero(as_tuple=False).view(-1)
+            raw_B = mask_2d_B[b].nonzero(as_tuple=False).view(-1)
+            if len(raw_A) == 0 or len(raw_B) == 0:
+                continue
+
+            raw_A_np = raw_A.cpu().numpy()
+            raw_B_np = raw_B.cpu().numpy()
+
+            common_raw = np.intersect1d(raw_A_np, raw_B_np)
+            if len(common_raw) == 0:
+                continue
+
+            src_A, tgt_A = indices_A[b]
+            src_B, tgt_B = indices_B[b]
+            tgt_A_np = tgt_A.cpu().numpy()
+            tgt_B_np = tgt_B.cpu().numpy()
+
+            # real, asymmetric A->B focal change for this image pair
+            delta_f_ab = torch.log(focal_B[b] / focal_A[b]).view(1, 1)
+
+            for raw_idx in common_raw:
+                pos_in_A = int((raw_A_np == raw_idx).nonzero()[0][0])
+                pos_in_B = int((raw_B_np == raw_idx).nonzero()[0][0])
+
+                match_A = (tgt_A_np == pos_in_A).nonzero()[0]
+                match_B = (tgt_B_np == pos_in_B).nonzero()[0]
+                if len(match_A) == 0 or len(match_B) == 0:
+                    continue
+
+                query_A = src_A[match_A[0]].item()
+                query_B = src_B[match_B[0]].item()
+
+                roi_vec_A = outputs_A['roi_vec'][b, query_A]  # real, observed at focal_A
+                roi_vec_B = outputs_B['roi_vec'][b, query_B]  # real, observed at focal_B
+
+                correction = self.model.focal_transform_net(roi_vec_A.unsqueeze(0), delta_f_ab).squeeze(0)
+                pred_B = roi_vec_A + correction
+
+                pair_loss = F.l1_loss(pred_B, roi_vec_B.detach())
+                identity_diff = F.l1_loss(roi_vec_A, roi_vec_B.detach())  # "do nothing" baseline for this pair
+
+                total_loss = total_loss + pair_loss
+                num_pairs += 1
+
+                raw_records.append({
+                    'b': b,
+                    'raw_idx': int(raw_idx),
+                    'query_A': query_A,
+                    'query_B': query_B,
+                    'focal_A': float(focal_A[b].item()),
+                    'focal_B': float(focal_B[b].item()),
+                    'delta_f': float(delta_f_ab.item()),
+                    'identity_diff': round(identity_diff.item(), 6),
+                    'pair_loss': round(pair_loss.item(), 6),
+                    'correction_norm': round(correction.norm().item(), 6),
+                    'roi_A_norm': round(roi_vec_A.norm().item(), 6),
+                    'roi_B_norm': round(roi_vec_B.norm().item(), 6),
+                })
+
+        if num_pairs == 0:
+            return zero, {'num_pairs': 0}, []
+
+        return total_loss / num_pairs, {'num_pairs': num_pairs}, raw_records
 
     def prepare_targets(self, targets, batch_size):
         targets_list = []
