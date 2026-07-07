@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
+from torchvision.ops import roi_align
 
 from lib.helpers.save_helper import get_checkpoint_state
 from lib.helpers.save_helper import load_checkpoint
@@ -125,6 +126,9 @@ class Trainer(object):
         consistency_coef = self.cfg.get('consistency_loss_coef', 0.1)
         use_focal_transform = getattr(self.model, 'use_focal_transform', False)
         focal_transform_coef = self.cfg.get('focal_transform_loss_coef', 0.0)
+        # the paired (focal-A/focal-B) forward path is needed by either feature -
+        # they're independent, but both rely on having two focal versions of the same image.
+        use_paired_path = use_consistency or use_focal_transform
 
         # CSV logging setup (consistency mode only)
         csv_path = os.path.join(self.output_dir, 'consistency_log.csv')
@@ -145,10 +149,10 @@ class Trainer(object):
         # raw, per-matched-object-pair log (one row per pair, not averaged) - lets you
         # look at the actual distribution instead of just the batch-mean loss.
         ftr_raw_csv_path = os.path.join(self.output_dir, 'focal_transform_raw_log.csv')
-        ftr_raw_csv_header = ['epoch', 'iter', 'b', 'raw_idx', 'query_A', 'query_B',
+        ftr_raw_csv_header = ['epoch', 'iter', 'b', 'raw_idx',
                               'focal_A', 'focal_B', 'delta_f', 'identity_diff', 'pair_loss',
                               'correction_norm', 'roi_A_norm', 'roi_B_norm']
-        if use_consistency and use_focal_transform:
+        if use_focal_transform:
             os.makedirs(self.output_dir, exist_ok=True)
             with open(ftr_csv_path, 'a', newline='') as f:
                 w = csv.writer(f)
@@ -162,8 +166,8 @@ class Trainer(object):
         progress_bar = tqdm.tqdm(total=len(self.train_loader), leave=(self.epoch+1 == self.cfg['max_epoch']), desc='iters')
         for batch_idx, batch in enumerate(self.train_loader):
 
-            if use_consistency:
-                # ============ consistency training path ============
+            if use_paired_path:
+                # ============ paired (focal-A/focal-B) training path ============
                 (inputs_A, calibs_A, targets_A_raw, info_A), \
                 (inputs_B, calibs_B, targets_B_raw, info_B) = batch
 
@@ -200,11 +204,15 @@ class Trainer(object):
                 losses_dict_A = self.detr_loss(outputs_A, targets_A_list)
                 losses_dict_B = self.detr_loss(outputs_B, targets_B_list)
 
-                loss_cons, cons_stats = self.compute_consistency_loss(
-                    outputs_A, outputs_B,
-                    targets_A_list, targets_B_list,
-                    mask_2d_A, mask_2d_B,
-                )
+                if use_consistency:
+                    loss_cons, cons_stats = self.compute_consistency_loss(
+                        outputs_A, outputs_B,
+                        targets_A_list, targets_B_list,
+                        mask_2d_A, mask_2d_B,
+                    )
+                else:
+                    loss_cons = outputs_A['pred_3d_dim'].new_zeros(1).squeeze()
+                    cons_stats = {'num_pairs': 0, 'dim_diff': 0.0, 'angle_diff': 0.0}
 
                 if use_focal_transform:
                     loss_ftr, ftr_stats, ftr_raw_records = self.compute_focal_transform_loss(
@@ -224,7 +232,7 @@ class Trainer(object):
                 total_loss = loss_det_A + loss_det_B + consistency_coef * loss_cons + focal_transform_coef * loss_ftr
 
                 # CSV logging every 8 iterations
-                if batch_idx % 8 == 0:
+                if use_consistency and batch_idx % 8 == 0:
                     with open(csv_path, 'a', newline='') as f:
                         csv.writer(f).writerow([
                             epoch,
@@ -249,7 +257,7 @@ class Trainer(object):
                         w = csv.writer(f)
                         for rec in ftr_raw_records:
                             w.writerow([
-                                epoch, batch_idx, rec['b'], rec['raw_idx'], rec['query_A'], rec['query_B'],
+                                epoch, batch_idx, rec['b'], rec['raw_idx'],
                                 rec['focal_A'], rec['focal_B'], rec['delta_f'], rec['identity_diff'],
                                 rec['pair_loss'], rec['correction_norm'], rec['roi_A_norm'], rec['roi_B_norm'],
                             ])
@@ -408,21 +416,30 @@ class Trainer(object):
         focal-B feature (detached). This is what actually teaches focal_transform_net
         the source->target relationship - the correction wired into MonoIA.forward only
         gets an indirect signal from the detection losses (loss_dim/loss_angle/loss_depth).
+
+        Uses GT boxes (not the matcher/predicted boxes) to locate each object, since this
+        loss is training-only - it never runs at inference - so there's no need for it to
+        share the predicted-box code path, and GT boxes give a cleaner signal that isn't
+        degraded by early-training box-prediction noise.
         """
         zero = outputs_A['pred_3d_dim'].new_zeros(1).squeeze()
-        if 'roi_vec' not in outputs_A or 'roi_vec' not in outputs_B:
+        if 'backbone_feats' not in outputs_A or 'backbone_feats' not in outputs_B:
             return zero, {'num_pairs': 0}, []
 
-        batch_size = mask_2d_A.shape[0]
-        indices_A = self.detr_loss.matcher(outputs_A, targets_A_list, group_num=1)
-        indices_B = self.detr_loss.matcher(outputs_B, targets_B_list, group_num=1)
+        level = self.model.focal_transform_level
+        roi_size = self.model.focal_transform_roi_size
+        feat_A = outputs_A['backbone_feats'][level]  # [B, C, Hf, Wf]
+        feat_B = outputs_B['backbone_feats'][level]
+        Hf, Wf = feat_A.shape[-2:]
 
+        batch_size = mask_2d_A.shape[0]
         focal_A = targets_A_raw['target_focals']  # [B, 1]
         focal_B = targets_B_raw['target_focals']  # [B, 1]
 
-        total_loss = outputs_A['roi_vec'].new_zeros(1).squeeze()
-        num_pairs = 0
-        raw_records = []  # one row per matched object pair - for raw CSV logging
+        # pass 1: collect matched objects' GT boxes (feature-map pixel coords), grouped per image
+        boxes_A_per_img = [[] for _ in range(batch_size)]
+        boxes_B_per_img = [[] for _ in range(batch_size)]
+        pair_meta = []  # same order the boxes are appended in, so we can zip back up after RoIAlign
 
         for b in range(batch_size):
             raw_A = mask_2d_A[b].nonzero(as_tuple=False).view(-1)
@@ -432,62 +449,71 @@ class Trainer(object):
 
             raw_A_np = raw_A.cpu().numpy()
             raw_B_np = raw_B.cpu().numpy()
-
             common_raw = np.intersect1d(raw_A_np, raw_B_np)
             if len(common_raw) == 0:
                 continue
 
-            src_A, tgt_A = indices_A[b]
-            src_B, tgt_B = indices_B[b]
-            tgt_A_np = tgt_A.cpu().numpy()
-            tgt_B_np = tgt_B.cpu().numpy()
-
             # real, asymmetric A->B focal change for this image pair
-            delta_f_ab = torch.log(focal_B[b] / focal_A[b]).view(1, 1)
+            delta_f_ab = torch.log(focal_B[b] / focal_A[b])
 
             for raw_idx in common_raw:
                 pos_in_A = int((raw_A_np == raw_idx).nonzero()[0][0])
                 pos_in_B = int((raw_B_np == raw_idx).nonzero()[0][0])
 
-                match_A = (tgt_A_np == pos_in_A).nonzero()[0]
-                match_B = (tgt_B_np == pos_in_B).nonzero()[0]
-                if len(match_A) == 0 or len(match_B) == 0:
-                    continue
+                cx, cy, w, h = targets_A_list[b]['boxes'][pos_in_A]  # normalized GT box (cx,cy,w,h)
+                boxes_A_per_img[b].append(torch.stack([(cx - w / 2) * Wf, (cy - h / 2) * Hf,
+                                                        (cx + w / 2) * Wf, (cy + h / 2) * Hf]))
+                cx, cy, w, h = targets_B_list[b]['boxes'][pos_in_B]
+                boxes_B_per_img[b].append(torch.stack([(cx - w / 2) * Wf, (cy - h / 2) * Hf,
+                                                        (cx + w / 2) * Wf, (cy + h / 2) * Hf]))
 
-                query_A = src_A[match_A[0]].item()
-                query_B = src_B[match_B[0]].item()
-
-                roi_vec_A = outputs_A['roi_vec'][b, query_A]  # real, observed at focal_A
-                roi_vec_B = outputs_B['roi_vec'][b, query_B]  # real, observed at focal_B
-
-                correction = self.model.focal_transform_net(roi_vec_A.unsqueeze(0), delta_f_ab).squeeze(0)
-                pred_B = roi_vec_A + correction
-
-                pair_loss = F.l1_loss(pred_B, roi_vec_B.detach())
-                identity_diff = F.l1_loss(roi_vec_A, roi_vec_B.detach())  # "do nothing" baseline for this pair
-
-                total_loss = total_loss + pair_loss
-                num_pairs += 1
-
-                raw_records.append({
+                pair_meta.append({
                     'b': b,
                     'raw_idx': int(raw_idx),
-                    'query_A': query_A,
-                    'query_B': query_B,
                     'focal_A': float(focal_A[b].item()),
                     'focal_B': float(focal_B[b].item()),
                     'delta_f': float(delta_f_ab.item()),
-                    'identity_diff': round(identity_diff.item(), 6),
-                    'pair_loss': round(pair_loss.item(), 6),
-                    'correction_norm': round(correction.norm().item(), 6),
-                    'roi_A_norm': round(roi_vec_A.norm().item(), 6),
-                    'roi_B_norm': round(roi_vec_B.norm().item(), 6),
                 })
 
-        if num_pairs == 0:
+        if len(pair_meta) == 0:
             return zero, {'num_pairs': 0}, []
 
-        return total_loss / num_pairs, {'num_pairs': num_pairs}, raw_records
+        # pass 2: one batched RoIAlign call per branch, instead of one per object
+        boxes_A_list = [torch.stack(bs) if bs else feat_A.new_zeros(0, 4) for bs in boxes_A_per_img]
+        boxes_B_list = [torch.stack(bs) if bs else feat_B.new_zeros(0, 4) for bs in boxes_B_per_img]
+
+        roi_vecs_A = roi_align(feat_A, boxes_A_list, output_size=roi_size, aligned=True).mean(dim=[-1, -2])
+        roi_vecs_B = roi_align(feat_B, boxes_B_list, output_size=roi_size, aligned=True).mean(dim=[-1, -2])
+
+        delta_f_all = torch.tensor([m['delta_f'] for m in pair_meta],
+                                    device=roi_vecs_A.device, dtype=roi_vecs_A.dtype).view(-1, 1)
+
+        corrections = self.model.focal_transform_net(roi_vecs_A, delta_f_all)
+        pred_B = roi_vecs_A + corrections
+
+        pair_losses = F.l1_loss(pred_B, roi_vecs_B.detach(), reduction='none').mean(dim=-1)
+        identity_diffs = F.l1_loss(roi_vecs_A, roi_vecs_B.detach(), reduction='none').mean(dim=-1)
+        correction_norms = corrections.norm(dim=-1)
+        roi_A_norms = roi_vecs_A.norm(dim=-1)
+        roi_B_norms = roi_vecs_B.norm(dim=-1)
+
+        num_pairs = len(pair_meta)
+        raw_records = []
+        for i, meta in enumerate(pair_meta):
+            raw_records.append({
+                'b': meta['b'],
+                'raw_idx': meta['raw_idx'],
+                'focal_A': meta['focal_A'],
+                'focal_B': meta['focal_B'],
+                'delta_f': meta['delta_f'],
+                'identity_diff': round(identity_diffs[i].item(), 6),
+                'pair_loss': round(pair_losses[i].item(), 6),
+                'correction_norm': round(correction_norms[i].item(), 6),
+                'roi_A_norm': round(roi_A_norms[i].item(), 6),
+                'roi_B_norm': round(roi_B_norms[i].item(), 6),
+            })
+
+        return pair_losses.mean(), {'num_pairs': num_pairs}, raw_records
 
     def prepare_targets(self, targets, batch_size):
         targets_list = []

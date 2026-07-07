@@ -25,7 +25,10 @@ def build_dataloader(cfg, workers=4):
     else:
         raise NotImplementedError("%s dataset is not supported" % cfg['type'])
 
-    use_consistency_loss = cfg.get('use_consistency_loss', False)
+    # the paired (focal-A/focal-B) dataloader is needed by either the output-level
+    # consistency loss or the focal-transform relationship loss - they're independent
+    # features that both happen to need two focal versions of the same image.
+    use_paired_data = cfg.get('use_consistency_loss', False) or cfg.get('use_focal_transform', False)
 
     # prepare dataloader
     train_loader = DataLoader(dataset=train_set,
@@ -35,7 +38,7 @@ def build_dataloader(cfg, workers=4):
                               shuffle=True,
                               pin_memory=False,
                               drop_last=False,
-                              collate_fn=paired_collate_fn if use_consistency_loss else None)
+                              collate_fn=paired_collate_fn if use_paired_data else None)
     test_loader = DataLoader(dataset=test_set,
                              batch_size=cfg['batch_size'],
                              num_workers=workers,

@@ -351,6 +351,9 @@ class MonoIA(nn.Module):
         if self.use_focal_transform:
             out['roi_vec'] = roi_vecs[-1]
             out['roi_correction'] = roi_corrections[-1]
+            # raw per-level CNN features, exposed for the GT-box-based focal-transform
+            # relationship loss computed in trainer_helper.py (training-only, no matcher needed there).
+            out['backbone_feats'] = backbone_feats
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(

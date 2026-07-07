@@ -53,6 +53,8 @@ def main():
 
     # propagate consistency loss flag from trainer cfg to dataset cfg
     cfg["dataset"]["use_consistency_loss"] = cfg["trainer"].get("use_consistency_loss", False)
+    # focal_transform also needs the paired (focal-A/focal-B) dataloader, independently of consistency loss
+    cfg["dataset"]["use_focal_transform"] = cfg["model"].get("use_focal_transform", False)
 
     # build dataloader
     train_loader, test_loader = build_dataloader(cfg["dataset"])

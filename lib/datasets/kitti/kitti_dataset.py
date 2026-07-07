@@ -63,6 +63,9 @@ class KITTI_Dataset(data.Dataset):
         self.target_focal_list = cfg.get("target_focal_list", [748.8391264865, 900, 1100, 1300])
         self.test_focal = cfg.get("test_focal", 748.8391264865)
         self.use_consistency_loss = cfg.get("use_consistency_loss", False)
+        # the focal-transform relationship loss also needs two focal versions of the
+        # same image, independently of whether the output-level consistency loss is on.
+        self.use_paired_focal = self.use_consistency_loss or cfg.get("use_focal_transform", False)
 
         if self.class_merging:
             self.writelist.extend(["Van", "Truck"])
@@ -534,8 +537,9 @@ class KITTI_Dataset(data.Dataset):
                     object.ry += 2 * np.pi
 
         #  ============================   focal-dependent transform   ==============================
-        if self.use_consistency_loss and "train" in self.split:
-            # consistency training: two different focal versions of the same image
+        if self.use_paired_focal and "train" in self.split:
+            # paired training (consistency loss and/or focal-transform loss): two
+            # different focal versions of the same image
             focal_A = random.choice(self.target_focal_list)
             remaining = [f for f in self.target_focal_list if f != focal_A]
             focal_B = random.choice(remaining)
@@ -551,7 +555,7 @@ class KITTI_Dataset(data.Dataset):
             )
             return sample_A, sample_B
         else:
-            # single-focal path (val/test always, train when not use_consistency_loss)
+            # single-focal path (val/test always, train when not use_paired_focal)
             if "train" in self.split:
                 target_focal = random.choice(self.target_focal_list)
             else:
